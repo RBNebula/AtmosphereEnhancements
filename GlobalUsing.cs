@@ -5,6 +5,7 @@ global using System.IO;
 global using System.Linq;
 global using System.Reflection;
 global using BepInEx;
+global using BepInEx.Logging;
 global using BepInEx.Configuration;
 global using UnityEngine;
 global using UnityEngine.Networking;

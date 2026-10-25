@@ -1,44 +1,57 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net472</TargetFramework>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <AssemblyName>AtmosphereEnhancements</AssemblyName>
     <RootNamespace>AtmosphereEnhancements</RootNamespace>
+    <ResourcesDir>Resources</ResourcesDir>
+    <ResourcesImgDir>$(ResourcesDir)\Img</ResourcesImgDir>
+    <ResourcesAudioDir>$(ResourcesDir)\Audio</ResourcesAudioDir>
+    <ResourcesModelsDir>$(ResourcesDir)\Models</ResourcesModelsDir>
+    <ResourcesPosesDir>$(ResourcesDir)\Poses</ResourcesPosesDir>
+    <ResourcesShadersDir>$(ResourcesDir)\Shaders</ResourcesShadersDir>
+    <ResourcesMaterialsDir>$(ResourcesDir)\Materials</ResourcesMaterialsDir>
+    <ResourcesTexturesDir>$(ResourcesDir)\Textures</ResourcesTexturesDir>
+    <ResourcesDataDir>$(ResourcesDir)\Data</ResourcesDataDir>
   </PropertyGroup>
-
+  <PropertyGroup>
+    <MineMogulDir Condition="'$(MineMogulDir)' == ''">F:\SteamLibrary\steamapps\common\MineMogul</MineMogulDir>
+    <MineMogulManagedDir>$(MineMogulDir)\MineMogul_Data\Managed</MineMogulManagedDir>
+    <MineMogulBepInExCoreDir>$(MineMogulDir)\BepInEx\core</MineMogulBepInExCoreDir>
+    <MineMogulPluginsDir>$(MineMogulDir)\BepInEx\plugins</MineMogulPluginsDir>
+  </PropertyGroup>
   <ItemGroup>
     <Reference Include="BepInEx">
-      <HintPath>..\Libs\BepInEx.dll</HintPath>
+      <HintPath>$(MineMogulBepInExCoreDir)\BepInEx.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Assembly-CSharp">
-      <HintPath>..\Libs\Assembly-CSharp.dll</HintPath>
+      <HintPath>$(MineMogulManagedDir)\Assembly-CSharp.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine">
-      <HintPath>..\Libs\UnityEngine.dll</HintPath>
+      <HintPath>$(MineMogulManagedDir)\UnityEngine.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>..\Libs\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>$(MineMogulManagedDir)\UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.AudioModule">
-      <HintPath>..\Libs\UnityEngine.AudioModule.dll</HintPath>
+      <HintPath>$(MineMogulManagedDir)\UnityEngine.AudioModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.UnityWebRequestModule">
-      <HintPath>..\Libs\UnityEngine.UnityWebRequestModule.dll</HintPath>
+      <HintPath>$(MineMogulManagedDir)\UnityEngine.UnityWebRequestModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.UnityWebRequestAudioModule">
-      <HintPath>..\Libs\UnityEngine.UnityWebRequestAudioModule.dll</HintPath>
+      <HintPath>$(MineMogulManagedDir)\UnityEngine.UnityWebRequestAudioModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
-
   <ItemGroup>
-    <EmbeddedResource Include="Assets\DefaultAmbient\**\*.*" />
+    <EmbeddedResource Include="$(ResourcesAudioDir)\DefaultAmbient\**\*.*" />
   </ItemGroup>
 </Project>

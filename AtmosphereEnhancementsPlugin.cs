@@ -1,27 +1,8 @@
 namespace AtmosphereEnhancements;
 
-[BepInPlugin(PluginGuid, PluginName, PluginVersion)]
+[BepInPlugin(ModInfo.PLUGIN_GUID, ModInfo.PLUGIN_NAME, ModInfo.PLUGIN_VERSION)]
 public sealed class AtmosphereEnhancementsPlugin : BaseUnityPlugin
 {
-    public const string PluginGuid = "com.main.atmosphereenhancements";
-    public const string PluginName = "Atmosphere Enhancements";
-    public const string PluginVersion = "0.1.0";
-
-    private const string RuntimeAudioFolderName = "AmbientAudio";
-    private const string EmbeddedAudioPrefix = "AtmosphereEnhancements.Assets.DefaultAmbient.";
-
-    private static readonly string[] SupportedAudioExtensions =
-    {
-        ".ogg",
-        ".wav",
-        ".mp3",
-        ".aif",
-        ".aiff"
-    };
-
-    private readonly List<AmbientTrack> _tracks = new List<AmbientTrack>();
-    private readonly HashSet<AudioSource> _footstepSources = new HashSet<AudioSource>();
-
     private ConfigEntry<bool>? _enabled;
     private ConfigEntry<float>? _ambientVolume;
     private ConfigEntry<float>? _fadeSeconds;
@@ -39,652 +20,248 @@ public sealed class AtmosphereEnhancementsPlugin : BaseUnityPlugin
     private ConfigEntry<bool>? _streamLoadedAudio;
     private ConfigEntry<bool>? _verboseLogging;
 
-    private AudioSource? _ambientSource;
-    private string _runtimeAudioFolderPath = string.Empty;
+    private ConfigEntry<bool>? _enableOneShots;
+    private ConfigEntry<float>? _oneShotMinDelaySeconds;
+    private ConfigEntry<float>? _oneShotMaxDelaySeconds;
+    private ConfigEntry<float>? _oneShotBaseVolume;
+    private ConfigEntry<float>? _oneShotPitchVariance;
+    private ConfigEntry<float>? _oneShotVolumeVariance;
+    private ConfigEntry<float>? _oneShotNoiseThresholdOverride;
+    private ConfigEntry<bool>? _enableDrips;
+    private ConfigEntry<bool>? _enableCreaks;
+    private ConfigEntry<bool>? _enableRockTicks;
+    private ConfigEntry<bool>? _enableMetalClinks;
+    private ConfigEntry<bool>? _enableWind;
+    private ConfigEntry<float>? _dripsWeight;
+    private ConfigEntry<float>? _creaksWeight;
+    private ConfigEntry<float>? _rockTicksWeight;
+    private ConfigEntry<float>? _metalClinksWeight;
+    private ConfigEntry<float>? _windWeight;
 
-    private bool _tracksLoaded;
-    private bool _trackIsActive;
-    private bool _stopTrackAfterFadeOut;
-
-    private float _currentVolume;
-    private float _targetVolume;
-    private float _nextTrackAttemptAt;
-    private float _nextQuietSampleAt;
-    private float _cachedNonFootstepLoudness;
-    private float _loudDurationSeconds;
-    private float _nextFootstepCacheRefreshAt;
-
-    private int _lastTrackIndex = -1;
+    private AudioSource? _bedSource;
+    private AudioSource? _oneShotSource;
+    private AmbientAudioLibrary? _audioLibrary;
+    private AmbientNoiseMonitor? _noiseMonitor;
+    private AmbientBedManager? _bedManager;
+    private IncidentalAmbientManager? _oneShotManager;
 
     private void Awake()
     {
         BindConfig();
-        SetupAudioSource();
-        PrepareRuntimeAudioFolder();
-        ExportPackagedAudio();
-        StartCoroutine(LoadTracksFromRuntimeFolder());
-        ScheduleInitialTrackAttempt();
+
+        _bedSource = CreateAudioSource("AmbientBedsSource", priority: 64, defaultVolume: 0f);
+        _oneShotSource = CreateAudioSource("AmbientOneShotsSource", priority: 80, defaultVolume: 0f);
+
+        if (!TryInitializeSystems())
+        {
+            enabled = false;
+            return;
+        }
+
+        StartCoroutine(LoadAudioLibrary());
     }
 
     private void Update()
     {
-        if (_ambientSource == null || _enabled == null)
+        if (_enabled == null || _audioLibrary == null || _bedManager == null || _oneShotManager == null || _noiseMonitor == null)
         {
             return;
         }
 
         if (!_enabled.Value)
         {
-            if (_ambientSource.isPlaying)
-            {
-                _ambientSource.Stop();
-            }
-
-            _trackIsActive = false;
-            _stopTrackAfterFadeOut = false;
-            _targetVolume = 0f;
-            _currentVolume = 0f;
-            _ambientSource.volume = 0f;
-            _ambientSource.clip = null;
+            _bedManager.HandleDisabled();
+            _oneShotManager.HandleDisabled();
+            _noiseMonitor.Reset();
             return;
         }
 
-        UpdateVolumeFade();
+        _noiseMonitor.Update();
 
-        if (!_tracksLoaded)
+        if (!_audioLibrary.IsLoaded)
         {
             return;
         }
 
-        if (_trackIsActive)
-        {
-            if (_stopTrackAfterFadeOut)
-            {
-                return;
-            }
-
-            if (_stopIfNoLongerQuiet != null && _stopIfNoLongerQuiet.Value)
-            {
-                TickNoiseMonitorWhilePlaying();
-            }
-
-            if (!_ambientSource.isPlaying)
-            {
-                FinishTrack(interruptedByNoise: false);
-            }
-
-            return;
-        }
-
-        if (Time.realtimeSinceStartup >= _nextTrackAttemptAt)
-        {
-            TryStartTrack();
-        }
+        _bedManager.Update(_noiseMonitor);
+        _oneShotManager.Update(_noiseMonitor);
     }
 
     private void OnDestroy()
     {
         StopAllCoroutines();
-        DestroyLoadedTracks();
+
+        _bedManager?.HandleDisabled();
+        _oneShotManager?.HandleDisabled();
+        _audioLibrary?.DestroyLoadedAudio();
+    }
+
+    private bool TryInitializeSystems()
+    {
+        if (_bedSource == null || _oneShotSource == null)
+        {
+            Logger.LogError("Failed to initialize audio sources.");
+            return false;
+        }
+
+        if (_onlyStartWhenQuiet == null
+            || _quietThresholdToStart == null
+            || _quietThresholdToKeepPlaying == null
+            || _quietCheckIntervalSeconds == null
+            || _stopIfNoLongerQuiet == null
+            || _requiredLoudDurationToStopSeconds == null
+            || _verboseLogging == null
+            || _quietRetrySeconds == null
+            || _ambientVolume == null
+            || _fadeSeconds == null
+            || _initialDelayMinSeconds == null
+            || _initialDelayMaxSeconds == null
+            || _silenceGapMinSeconds == null
+            || _silenceGapMaxSeconds == null
+            || _enableOneShots == null
+            || _oneShotMinDelaySeconds == null
+            || _oneShotMaxDelaySeconds == null
+            || _oneShotBaseVolume == null
+            || _oneShotPitchVariance == null
+            || _oneShotVolumeVariance == null
+            || _oneShotNoiseThresholdOverride == null
+            || _enableDrips == null
+            || _enableCreaks == null
+            || _enableRockTicks == null
+            || _enableMetalClinks == null
+            || _enableWind == null
+            || _dripsWeight == null
+            || _creaksWeight == null
+            || _rockTicksWeight == null
+            || _metalClinksWeight == null
+            || _windWeight == null)
+        {
+            Logger.LogError("AtmosphereEnhancements config was not fully initialized.");
+            return false;
+        }
+
+        _audioLibrary = new AmbientAudioLibrary(Logger);
+        string pluginDirectory = Path.GetDirectoryName(Info.Location) ?? Paths.PluginPath;
+        _audioLibrary.PrepareRuntimeAudioFolder(pluginDirectory);
+        _audioLibrary.ExportPackagedAudio(Assembly.GetExecutingAssembly());
+
+        _noiseMonitor = new AmbientNoiseMonitor(
+            Logger,
+            _onlyStartWhenQuiet,
+            _quietThresholdToStart,
+            _quietThresholdToKeepPlaying,
+            _quietCheckIntervalSeconds,
+            _stopIfNoLongerQuiet,
+            _requiredLoudDurationToStopSeconds,
+            _verboseLogging);
+
+        _noiseMonitor.RegisterIgnoredSource(_bedSource);
+        _noiseMonitor.RegisterIgnoredSource(_oneShotSource);
+
+        _bedManager = new AmbientBedManager(
+            _bedSource,
+            Logger,
+            _ambientVolume,
+            _fadeSeconds,
+            _initialDelayMinSeconds,
+            _initialDelayMaxSeconds,
+            _silenceGapMinSeconds,
+            _silenceGapMaxSeconds,
+            _quietRetrySeconds);
+
+        _oneShotManager = new IncidentalAmbientManager(
+            _oneShotSource,
+            Logger,
+            _enableOneShots,
+            _oneShotMinDelaySeconds,
+            _oneShotMaxDelaySeconds,
+            _oneShotBaseVolume,
+            _oneShotPitchVariance,
+            _oneShotVolumeVariance,
+            _oneShotNoiseThresholdOverride,
+            _enableDrips,
+            _enableCreaks,
+            _enableRockTicks,
+            _enableMetalClinks,
+            _enableWind,
+            _dripsWeight,
+            _creaksWeight,
+            _rockTicksWeight,
+            _metalClinksWeight,
+            _windWeight);
+
+        return true;
+    }
+
+    private IEnumerator LoadAudioLibrary()
+    {
+        if (_audioLibrary == null || _streamLoadedAudio == null || _bedManager == null || _oneShotManager == null)
+        {
+            yield break;
+        }
+
+        yield return StartCoroutine(_audioLibrary.LoadTracksFromRuntimeFolder(_streamLoadedAudio.Value));
+
+        _bedManager.SetTracks(_audioLibrary.BedTracks);
+        _oneShotManager.SetTracks(_audioLibrary.OneShotTracksByCategory);
     }
 
     private void BindConfig()
     {
-        _enabled = Config.Bind("General", "Enabled", true, "Master toggle for ambient playback.");
-        _ambientVolume = Config.Bind("General", "AmbientVolume", 0.35f, "Base ambient volume (0-1).");
-        _fadeSeconds = Config.Bind("General", "FadeSeconds", 2.5f, "Fade duration in seconds when starting/stopping ambient tracks.");
-        _initialDelayMinSeconds = Config.Bind("Timing", "InitialDelayMinSeconds", 25f, "Minimum delay before the first track attempt.");
-        _initialDelayMaxSeconds = Config.Bind("Timing", "InitialDelayMaxSeconds", 90f, "Maximum delay before the first track attempt.");
-        _silenceGapMinSeconds = Config.Bind("Timing", "SilenceGapMinSeconds", 70f, "Minimum silence gap between tracks.");
-        _silenceGapMaxSeconds = Config.Bind("Timing", "SilenceGapMaxSeconds", 220f, "Maximum silence gap between tracks.");
-        _onlyStartWhenQuiet = Config.Bind("QuietMode", "OnlyStartWhenQuiet", true, "Only start a track when nearby non-footstep audio is below the threshold.");
-        _quietThresholdToStart = Config.Bind("QuietMode", "QuietThresholdToStart", 0.35f, "Estimated non-footstep loudness threshold required to start a track.");
-        _quietThresholdToKeepPlaying = Config.Bind("QuietMode", "QuietThresholdToKeepPlaying", 0.65f, "If stop-when-loud is enabled, loudness above this value can stop a track.");
+        _enabled = Config.Bind("General", "Enabled", true, "Master toggle for all ambience playback.");
+        _ambientVolume = Config.Bind("General", "AmbientVolume", 0.35f, "Base volume for long ambient beds (0-1).");
+        _fadeSeconds = Config.Bind("General", "FadeSeconds", 2.5f, "Fade duration in seconds when starting or stopping ambient beds.");
+
+        _initialDelayMinSeconds = Config.Bind("Timing", "InitialDelayMinSeconds", 25f, "Minimum delay before the first ambient bed attempt.");
+        _initialDelayMaxSeconds = Config.Bind("Timing", "InitialDelayMaxSeconds", 90f, "Maximum delay before the first ambient bed attempt.");
+        _silenceGapMinSeconds = Config.Bind("Timing", "SilenceGapMinSeconds", 70f, "Minimum silence gap between finished ambient beds.");
+        _silenceGapMaxSeconds = Config.Bind("Timing", "SilenceGapMaxSeconds", 220f, "Maximum silence gap between finished ambient beds.");
+
+        _onlyStartWhenQuiet = Config.Bind("QuietMode", "OnlyStartWhenQuiet", true, "Only allow ambience to start when nearby non-footstep audio is below the threshold.");
+        _quietThresholdToStart = Config.Bind("QuietMode", "QuietThresholdToStart", 0.35f, "Estimated non-footstep loudness threshold required to start ambience.");
+        _quietThresholdToKeepPlaying = Config.Bind("QuietMode", "QuietThresholdToKeepPlaying", 0.65f, "If stop-when-loud is enabled, loudness above this value can stop a playing ambient bed.");
         _quietCheckIntervalSeconds = Config.Bind("QuietMode", "QuietCheckIntervalSeconds", 1.5f, "Seconds between nearby loudness checks.");
-        _quietRetrySeconds = Config.Bind("QuietMode", "QuietRetrySeconds", 12f, "Retry delay when a track could not start because the world was too loud.");
-        _stopIfNoLongerQuiet = Config.Bind("QuietMode", "StopIfNoLongerQuiet", true, "Fade out and stop a track when machines/noise become too loud nearby.");
-        _requiredLoudDurationToStopSeconds = Config.Bind("QuietMode", "RequiredLoudDurationToStopSeconds", 4f, "How long it must stay loud before stopping a currently playing track.");
-        _streamLoadedAudio = Config.Bind("Loading", "StreamLoadedAudio", true, "Use streaming mode when loading clips from files (better for long tracks).");
+        _quietRetrySeconds = Config.Bind("QuietMode", "QuietRetrySeconds", 12f, "Retry delay when quiet-mode blocks an ambience start.");
+        _stopIfNoLongerQuiet = Config.Bind("QuietMode", "StopIfNoLongerQuiet", true, "Fade out and stop a bed when nearby machines or other noise stay too loud.");
+        _requiredLoudDurationToStopSeconds = Config.Bind("QuietMode", "RequiredLoudDurationToStopSeconds", 4f, "How long the world must stay loud before a playing bed is stopped.");
+
+        _streamLoadedAudio = Config.Bind("Loading", "StreamLoadedAudio", true, "Use streaming mode when loading clips from files.");
         _verboseLogging = Config.Bind("Debug", "VerboseLogging", false, "Enable extra logging for quiet checks and playback decisions.");
+
+        _enableOneShots = Config.Bind("OneShots", "EnableOneShots", true, "Enable short incidental one-shot ambience.");
+        _oneShotMinDelaySeconds = Config.Bind("OneShots", "OneShotMinDelaySeconds", 15f, "Minimum delay between incidental one-shot attempts.");
+        _oneShotMaxDelaySeconds = Config.Bind("OneShots", "OneShotMaxDelaySeconds", 15f, "Maximum delay between incidental one-shot attempts.");
+        _oneShotBaseVolume = Config.Bind("OneShots", "OneShotBaseVolume", 0.18f, "Base volume for incidental one-shots (0-1).");
+        _oneShotPitchVariance = Config.Bind("OneShots", "OneShotPitchVariance", 0.04f, "Random pitch variance for one-shots. Example: 0.04 allows a pitch range from 0.96 to 1.04.");
+        _oneShotVolumeVariance = Config.Bind("OneShots", "OneShotVolumeVariance", 0.03f, "Random volume variance for one-shots.");
+        _oneShotNoiseThresholdOverride = Config.Bind("OneShots", "OneShotNoiseThresholdOverride", 0f, "Optional quiet-mode start threshold override for one-shots. Set to 0 to reuse QuietThresholdToStart.");
+
+        _enableDrips = Config.Bind("OneShotCategories", "EnableDrips", true, "Allow water drip and similar small detail one-shots.");
+        _enableCreaks = Config.Bind("OneShotCategories", "EnableCreaks", true, "Allow cave creak one-shots.");
+        _enableRockTicks = Config.Bind("OneShotCategories", "EnableRockTicks", true, "Allow subtle rock tick one-shots.");
+        _enableMetalClinks = Config.Bind("OneShotCategories", "EnableMetalClinks", true, "Allow distant faint metallic clink one-shots.");
+        _enableWind = Config.Bind("OneShotCategories", "EnableWind", true, "Allow light wind and air-movement one-shots.");
+
+        _dripsWeight = Config.Bind("OneShotWeights", "DripsWeight", 5f, "Relative selection weight for drip one-shots.");
+        _creaksWeight = Config.Bind("OneShotWeights", "CreaksWeight", 2f, "Relative selection weight for creak one-shots.");
+        _rockTicksWeight = Config.Bind("OneShotWeights", "RockTicksWeight", 2f, "Relative selection weight for rock tick one-shots.");
+        _metalClinksWeight = Config.Bind("OneShotWeights", "MetalClinksWeight", 1f, "Relative selection weight for metallic clink one-shots.");
+        _windWeight = Config.Bind("OneShotWeights", "WindWeight", 3f, "Relative selection weight for wind one-shots.");
     }
 
-    private void SetupAudioSource()
+    private AudioSource CreateAudioSource(string childName, int priority, float defaultVolume)
     {
-        _ambientSource = gameObject.AddComponent<AudioSource>();
-        _ambientSource.playOnAwake = false;
-        _ambientSource.loop = false;
-        _ambientSource.spatialBlend = 0f;
-        _ambientSource.priority = 64;
-        _ambientSource.ignoreListenerPause = true;
-        _ambientSource.volume = 0f;
-        _ambientSource.dopplerLevel = 0f;
-    }
-
-    private void PrepareRuntimeAudioFolder()
-    {
-        string pluginDirectory = Path.GetDirectoryName(Info.Location) ?? Paths.PluginPath;
-        _runtimeAudioFolderPath = Path.Combine(pluginDirectory, RuntimeAudioFolderName);
-        Directory.CreateDirectory(_runtimeAudioFolderPath);
-
-        string guidanceFilePath = Path.Combine(_runtimeAudioFolderPath, "_ADD_AMBIENT_AUDIO_HERE.txt");
-        if (!File.Exists(guidanceFilePath))
-        {
-            File.WriteAllLines(guidanceFilePath, new[]
-            {
-                "Atmosphere Enhancements - Runtime audio folder",
-                "Drop extra ambient tracks here and restart the game.",
-                "Supported formats: .ogg .wav .mp3 .aif .aiff",
-                "This folder is read by the mod at startup.",
-                "Packaged tracks from the DLL are exported here automatically."
-            });
-        }
-    }
-
-    private void ExportPackagedAudio()
-    {
-        if (string.IsNullOrWhiteSpace(_runtimeAudioFolderPath))
-        {
-            return;
-        }
-
-        Assembly assembly = Assembly.GetExecutingAssembly();
-        string[] resources = assembly
-            .GetManifestResourceNames()
-            .Where(name => name.StartsWith(EmbeddedAudioPrefix, StringComparison.Ordinal))
-            .ToArray();
-
-        int exportedCount = 0;
-        for (int i = 0; i < resources.Length; i++)
-        {
-            string resourceName = resources[i];
-            string fileName = resourceName.Substring(EmbeddedAudioPrefix.Length);
-            if (string.IsNullOrWhiteSpace(fileName))
-            {
-                continue;
-            }
-
-            string outputPath = Path.Combine(_runtimeAudioFolderPath, fileName);
-            if (File.Exists(outputPath))
-            {
-                continue;
-            }
-
-            using Stream? resourceStream = assembly.GetManifestResourceStream(resourceName);
-            if (resourceStream == null)
-            {
-                continue;
-            }
-
-            using FileStream outputStream = File.Create(outputPath);
-            resourceStream.CopyTo(outputStream);
-            exportedCount++;
-        }
-
-        if (exportedCount > 0)
-        {
-            Logger.LogInfo($"Exported {exportedCount} packaged ambient file(s) to: {_runtimeAudioFolderPath}");
-        }
-    }
-
-    private IEnumerator LoadTracksFromRuntimeFolder()
-    {
-        _tracksLoaded = false;
-        DestroyLoadedTracks();
-
-        if (string.IsNullOrWhiteSpace(_runtimeAudioFolderPath) || !Directory.Exists(_runtimeAudioFolderPath))
-        {
-            Logger.LogWarning("Runtime ambient folder does not exist. Ambient playback is disabled.");
-            _tracksLoaded = true;
-            yield break;
-        }
-
-        string[] files = Directory
-            .EnumerateFiles(_runtimeAudioFolderPath, "*.*", SearchOption.AllDirectories)
-            .Where(IsSupportedAudioFile)
-            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        if (files.Length == 0)
-        {
-            Logger.LogWarning($"No ambient audio files found in '{_runtimeAudioFolderPath}'.");
-            _tracksLoaded = true;
-            yield break;
-        }
-
-        Logger.LogInfo($"Loading {files.Length} ambient audio file(s) from: {_runtimeAudioFolderPath}");
-
-        for (int i = 0; i < files.Length; i++)
-        {
-            string path = files[i];
-            AudioClip? loadedClip = null;
-            string? error = null;
-
-            yield return StartCoroutine(LoadClipFromFile(
-                path,
-                clip => loadedClip = clip,
-                message => error = message));
-
-            if (loadedClip != null)
-            {
-                _tracks.Add(new AmbientTrack(path, loadedClip));
-            }
-            else
-            {
-                Logger.LogWarning($"Failed to load ambient clip '{path}': {error ?? "Unknown error"}");
-            }
-        }
-
-        _tracksLoaded = true;
-        Logger.LogInfo($"Ambient loading complete. Loaded {_tracks.Count} track(s).");
-    }
-
-    private IEnumerator LoadClipFromFile(string filePath, Action<AudioClip> onLoaded, Action<string> onFailed)
-    {
-        string extension = Path.GetExtension(filePath).ToLowerInvariant();
-        AudioType audioType = GetAudioType(extension);
-        if (audioType == AudioType.UNKNOWN)
-        {
-            onFailed("Unsupported extension: " + extension);
-            yield break;
-        }
-
-        Uri fileUri = new Uri(filePath);
-        using UnityWebRequest request = UnityWebRequestMultimedia.GetAudioClip(fileUri.AbsoluteUri, audioType);
-        if (request.downloadHandler is DownloadHandlerAudioClip handler && _streamLoadedAudio != null)
-        {
-            handler.streamAudio = _streamLoadedAudio.Value;
-        }
-
-        yield return request.SendWebRequest();
-
-        if (request.result == UnityWebRequest.Result.ConnectionError || request.result == UnityWebRequest.Result.ProtocolError)
-        {
-            onFailed(request.error ?? "Unknown UnityWebRequest error");
-            yield break;
-        }
-
-        AudioClip clip = DownloadHandlerAudioClip.GetContent(request);
-        if (clip == null)
-        {
-            onFailed("Unity returned a null AudioClip.");
-            yield break;
-        }
-
-        clip.name = Path.GetFileNameWithoutExtension(filePath);
-        onLoaded(clip);
-    }
-
-    private void ScheduleInitialTrackAttempt()
-    {
-        float min = Mathf.Max(0f, _initialDelayMinSeconds?.Value ?? 0f);
-        float max = Mathf.Max(min, _initialDelayMaxSeconds?.Value ?? min);
-        _nextTrackAttemptAt = Time.realtimeSinceStartup + UnityEngine.Random.Range(min, max);
-    }
-
-    private void ScheduleNextTrackAttempt(float delaySeconds)
-    {
-        _nextTrackAttemptAt = Time.realtimeSinceStartup + Mathf.Max(0f, delaySeconds);
-    }
-
-    private void TryStartTrack()
-    {
-        if (_ambientSource == null)
-        {
-            return;
-        }
-
-        if (_tracks.Count == 0)
-        {
-            ScheduleNextTrackAttempt(_quietRetrySeconds?.Value ?? 10f);
-            return;
-        }
-
-        if (_onlyStartWhenQuiet != null && _onlyStartWhenQuiet.Value)
-        {
-            float startThreshold = Mathf.Max(0f, _quietThresholdToStart?.Value ?? 0.35f);
-            bool quietEnough = IsWorldQuiet(startThreshold);
-            if (!quietEnough)
-            {
-                if (_verboseLogging != null && _verboseLogging.Value)
-                {
-                    Logger.LogInfo($"Ambient start blocked by nearby noise. Loudness={_cachedNonFootstepLoudness:F3}, threshold={startThreshold:F3}");
-                }
-
-                ScheduleNextTrackAttempt(Mathf.Max(1f, _quietRetrySeconds?.Value ?? 12f));
-                return;
-            }
-        }
-
-        int trackIndex = UnityEngine.Random.Range(0, _tracks.Count);
-        if (_tracks.Count > 1 && trackIndex == _lastTrackIndex)
-        {
-            trackIndex = (trackIndex + 1 + UnityEngine.Random.Range(0, _tracks.Count - 1)) % _tracks.Count;
-        }
-        _lastTrackIndex = trackIndex;
-
-        AmbientTrack track = _tracks[trackIndex];
-        _ambientSource.clip = track.Clip;
-        _ambientSource.volume = 0f;
-        _ambientSource.Play();
-
-        _currentVolume = 0f;
-        _targetVolume = Mathf.Clamp01(_ambientVolume?.Value ?? 0.35f);
-        _trackIsActive = true;
-        _stopTrackAfterFadeOut = false;
-        _loudDurationSeconds = 0f;
-
-        Logger.LogInfo($"Playing ambient track: {Path.GetFileName(track.FilePath)}");
-    }
-
-    private void TickNoiseMonitorWhilePlaying()
-    {
-        float now = Time.realtimeSinceStartup;
-        float interval = Mathf.Max(0.2f, _quietCheckIntervalSeconds?.Value ?? 1.5f);
-        if (now < _nextQuietSampleAt)
-        {
-            return;
-        }
-
-        float keepPlayingThreshold = Mathf.Max(0f, _quietThresholdToKeepPlaying?.Value ?? 0.65f);
-        bool quietEnough = IsWorldQuiet(keepPlayingThreshold);
-        if (quietEnough)
-        {
-            _loudDurationSeconds = 0f;
-            return;
-        }
-
-        _loudDurationSeconds += interval;
-        float requiredDuration = Mathf.Max(0.5f, _requiredLoudDurationToStopSeconds?.Value ?? 4f);
-        if (_loudDurationSeconds >= requiredDuration)
-        {
-            if (_verboseLogging != null && _verboseLogging.Value)
-            {
-                Logger.LogInfo($"Stopping ambient due to sustained nearby noise. Loudness={_cachedNonFootstepLoudness:F3}, threshold={keepPlayingThreshold:F3}");
-            }
-
-            _targetVolume = 0f;
-            _stopTrackAfterFadeOut = true;
-            _loudDurationSeconds = 0f;
-        }
-    }
-
-    private void UpdateVolumeFade()
-    {
-        if (_ambientSource == null)
-        {
-            return;
-        }
-
-        float fadeDuration = Mathf.Max(0.01f, _fadeSeconds?.Value ?? 2.5f);
-        _currentVolume = Mathf.MoveTowards(_currentVolume, _targetVolume, Time.unscaledDeltaTime / fadeDuration);
-        _ambientSource.volume = _currentVolume;
-
-        if (_stopTrackAfterFadeOut && _currentVolume <= 0.001f)
-        {
-            _ambientSource.Stop();
-            FinishTrack(interruptedByNoise: true);
-        }
-    }
-
-    private void FinishTrack(bool interruptedByNoise)
-    {
-        if (_ambientSource == null)
-        {
-            return;
-        }
-
-        _trackIsActive = false;
-        _stopTrackAfterFadeOut = false;
-        _targetVolume = 0f;
-        _currentVolume = 0f;
-        _ambientSource.volume = 0f;
-        _ambientSource.clip = null;
-        _loudDurationSeconds = 0f;
-
-        if (interruptedByNoise)
-        {
-            float retryDelay = Mathf.Max(1f, _quietRetrySeconds?.Value ?? 12f);
-            ScheduleNextTrackAttempt(retryDelay);
-            return;
-        }
-
-        float minGap = Mathf.Max(0f, _silenceGapMinSeconds?.Value ?? 70f);
-        float maxGap = Mathf.Max(minGap, _silenceGapMaxSeconds?.Value ?? 220f);
-        ScheduleNextTrackAttempt(UnityEngine.Random.Range(minGap, maxGap));
-    }
-
-    private bool IsWorldQuiet(float threshold)
-    {
-        float now = Time.realtimeSinceStartup;
-        if (now >= _nextQuietSampleAt)
-        {
-            _cachedNonFootstepLoudness = SampleNearbyNonFootstepLoudness(threshold);
-            _nextQuietSampleAt = now + Mathf.Max(0.2f, _quietCheckIntervalSeconds?.Value ?? 1.5f);
-        }
-
-        return _cachedNonFootstepLoudness <= threshold;
-    }
-
-    private float SampleNearbyNonFootstepLoudness(float earlyExitThreshold)
-    {
-        if (!TryGetListenerPosition(out Vector3 listenerPosition))
-        {
-            return 0f;
-        }
-
-        RefreshFootstepSourceCacheIfNeeded();
-
-        AudioSource[] allSources = FindObjectsByType<AudioSource>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
-        float loudness = 0f;
-
-        for (int i = 0; i < allSources.Length; i++)
-        {
-            AudioSource? source = allSources[i];
-            if (source == null || source == _ambientSource)
-            {
-                continue;
-            }
-
-            if (!source.isActiveAndEnabled || !source.isPlaying || source.mute)
-            {
-                continue;
-            }
-
-            if (IsLikelyFootstepSource(source))
-            {
-                continue;
-            }
-
-            loudness += EstimateAudibilityAtListener(source, listenerPosition);
-            if (loudness > earlyExitThreshold)
-            {
-                break;
-            }
-        }
-
-        return loudness;
-    }
-
-    private bool TryGetListenerPosition(out Vector3 listenerPosition)
-    {
-        listenerPosition = Vector3.zero;
-        AudioListener? listener = FindAnyObjectByType<AudioListener>(FindObjectsInactive.Exclude);
-        if (listener == null)
-        {
-            return false;
-        }
-
-        listenerPosition = listener.transform.position;
-        return true;
-    }
-
-    private void RefreshFootstepSourceCacheIfNeeded()
-    {
-        float now = Time.realtimeSinceStartup;
-        if (now < _nextFootstepCacheRefreshAt)
-        {
-            return;
-        }
-
-        _nextFootstepCacheRefreshAt = now + 5f;
-        _footstepSources.Clear();
-
-        PlayerFootsteps[] footstepComponents = FindObjectsByType<PlayerFootsteps>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
-        for (int i = 0; i < footstepComponents.Length; i++)
-        {
-            PlayerFootsteps footstep = footstepComponents[i];
-            if (footstep == null)
-            {
-                continue;
-            }
-
-            TryCacheSourceFromSoundPlayer(footstep.SoundPlayerLeft);
-            TryCacheSourceFromSoundPlayer(footstep.SoundPlayerRight);
-        }
-    }
-
-    private void TryCacheSourceFromSoundPlayer(SoundPlayer? soundPlayer)
-    {
-        if (soundPlayer == null)
-        {
-            return;
-        }
-
-        AudioSource? source = soundPlayer.GetComponent<AudioSource>();
-        if (source != null)
-        {
-            _footstepSources.Add(source);
-        }
-    }
-
-    private bool IsLikelyFootstepSource(AudioSource source)
-    {
-        if (_footstepSources.Contains(source))
-        {
-            return true;
-        }
-
-        if (source.GetComponentInParent<PlayerFootsteps>() != null)
-        {
-            return true;
-        }
-
-        string gameObjectName = source.gameObject.name ?? string.Empty;
-        string clipName = source.clip != null ? source.clip.name ?? string.Empty : string.Empty;
-
-        return gameObjectName.IndexOf("footstep", StringComparison.OrdinalIgnoreCase) >= 0
-               || gameObjectName.IndexOf("foot", StringComparison.OrdinalIgnoreCase) >= 0
-               || clipName.IndexOf("footstep", StringComparison.OrdinalIgnoreCase) >= 0;
-    }
-
-    private static float EstimateAudibilityAtListener(AudioSource source, Vector3 listenerPosition)
-    {
-        if (source.volume <= 0.0001f)
-        {
-            return 0f;
-        }
-
-        if (source.spatialBlend <= 0.01f)
-        {
-            return 0f;
-        }
-
-        float minDistance = Mathf.Max(0.001f, source.minDistance);
-        float maxDistance = Mathf.Max(minDistance, source.maxDistance);
-        float distance = Vector3.Distance(source.transform.position, listenerPosition);
-
-        if (distance >= maxDistance)
-        {
-            return 0f;
-        }
-
-        float attenuation;
-        if (distance <= minDistance)
-        {
-            attenuation = 1f;
-        }
-        else if (source.rolloffMode == AudioRolloffMode.Logarithmic)
-        {
-            attenuation = minDistance / distance;
-        }
-        else
-        {
-            attenuation = 1f - ((distance - minDistance) / Mathf.Max(0.001f, maxDistance - minDistance));
-        }
-
-        attenuation = Mathf.Clamp01(attenuation);
-        return source.volume * attenuation * Mathf.Clamp01(source.spatialBlend);
-    }
-
-    private static bool IsSupportedAudioFile(string filePath)
-    {
-        string extension = Path.GetExtension(filePath).ToLowerInvariant();
-        for (int i = 0; i < SupportedAudioExtensions.Length; i++)
-        {
-            if (extension == SupportedAudioExtensions[i])
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static AudioType GetAudioType(string extension)
-    {
-        switch (extension)
-        {
-            case ".ogg":
-                return AudioType.OGGVORBIS;
-            case ".wav":
-                return AudioType.WAV;
-            case ".mp3":
-                return AudioType.MPEG;
-            case ".aif":
-            case ".aiff":
-                return AudioType.AIFF;
-            default:
-                return AudioType.UNKNOWN;
-        }
-    }
-
-    private void DestroyLoadedTracks()
-    {
-        for (int i = 0; i < _tracks.Count; i++)
-        {
-            AmbientTrack track = _tracks[i];
-            if (track.Clip != null)
-            {
-                Destroy(track.Clip);
-            }
-        }
-
-        _tracks.Clear();
-        _lastTrackIndex = -1;
-        _tracksLoaded = false;
-        _trackIsActive = false;
-        _stopTrackAfterFadeOut = false;
-        _currentVolume = 0f;
-        _targetVolume = 0f;
-
-        if (_ambientSource != null)
-        {
-            _ambientSource.Stop();
-            _ambientSource.clip = null;
-            _ambientSource.volume = 0f;
-        }
-    }
-
-    private sealed class AmbientTrack
-    {
-        public AmbientTrack(string filePath, AudioClip clip)
-        {
-            FilePath = filePath;
-            Clip = clip;
-        }
-
-        public string FilePath { get; }
-
-        public AudioClip Clip { get; }
+        GameObject child = new GameObject(childName);
+        child.transform.SetParent(transform, false);
+
+        AudioSource source = child.AddComponent<AudioSource>();
+        source.playOnAwake = false;
+        source.loop = false;
+        source.spatialBlend = 0f;
+        source.priority = priority;
+        source.ignoreListenerPause = true;
+        source.volume = defaultVolume;
+        source.dopplerLevel = 0f;
+        return source;
     }
 }
